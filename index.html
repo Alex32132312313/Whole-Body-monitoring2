@@ -1,0 +1,877 @@
+import { useState, useCallback, useRef, useEffect } from "react";
+
+// ═══════════════════════════════════════════════════════════════
+//  GALAXY WATCH CSV PARSER
+//  Handles Samsung Health export format from Galaxy Watch 8
+// ═══════════════════════════════════════════════════════════════
+
+function parseCSV(text) {
+  const lines = text.trim().split(/\r?\n/);
+  if (lines.length < 2) return [];
+  const headers = lines[0].split(",").map(h => h.trim().replace(/^"|"$/g, "").toLowerCase());
+  return lines.slice(1).map(line => {
+    const vals = line.match(/(".*?"|[^,]+|(?<=,)(?=,)|(?<=,)$|^(?=,))/g) || [];
+    const row = {};
+    headers.forEach((h, i) => {
+      row[h] = (vals[i] || "").replace(/^"|"$/g, "").trim();
+    });
+    return row;
+  });
+}
+
+function detectMetricType(filename, headers) {
+  const f = filename.toLowerCase();
+  const h = headers.join(" ").toLowerCase();
+  if (f.includes("step") || h.includes("step_count")) return "steps";
+  if (f.includes("calorie") || h.includes("calorie")) return "calories";
+  if (f.includes("exercise") || f.includes("active") || h.includes("active_time")) return "activeMinutes";
+  if (f.includes("heart") || f.includes("hr") || h.includes("heart_rate")) return "heartRate";
+  if (f.includes("ecg") || h.includes("ecg")) return "ecg";
+  if (f.includes("oxygen") || f.includes("spo2") || h.includes("spo2")) return "spO2";
+  if (f.includes("sleep") || h.includes("sleep")) return "sleep";
+  if (f.includes("stress") || h.includes("stress")) return "stress";
+  if (f.includes("body") || f.includes("composition") || h.includes("body_fat")) return "bodyComposition";
+  if (f.includes("blood_pressure") || f.includes("bp") || h.includes("systolic")) return "bloodPressure";
+  if (f.includes("menstrual") || f.includes("cycle") || h.includes("cycle_phase")) return "menstrual";
+  if (f.includes("fall") || h.includes("fall")) return "fallDetection";
+  if (f.includes("apnea") || h.includes("ahi")) return "sleepApnea";
+  if (f.includes("antioxidant") || f.includes("carotenoid") || h.includes("carotenoid")) return "antioxidant";
+  if (f.includes("energy") || h.includes("energy_score")) return "energyScore";
+  return "unknown";
+}
+
+function extractMetricValue(rows, type) {
+  if (!rows.length) return null;
+  const latest = rows[rows.length - 1];
+  switch (type) {
+    case "steps": {
+      const val = parseFloat(latest.step_count || latest.steps || latest.count || 0);
+      const weekly = rows.slice(-7).map(r => parseFloat(r.step_count || r.steps || 0));
+      return { value: val, goal: 15000, unit: "steps", trend: calcTrend(rows, "step_count"), weekly };
+    }
+    case "calories": {
+      const val = parseFloat(latest.calorie || latest.calories || latest.active_calorie || 0);
+      return { value: val, goal: 3200, unit: "kcal", trend: calcTrend(rows, "calorie"), weekly: rows.slice(-7).map(r => parseFloat(r.calorie || r.calories || 0)) };
+    }
+    case "activeMinutes": {
+      const val = parseFloat(latest.active_time || latest.duration || latest.active_minutes || 0);
+      return { value: Math.round(val / 60) || val, goal: 90, unit: "min", trend: calcTrend(rows, "active_time"), weekly: rows.slice(-7).map(r => Math.round(parseFloat(r.active_time || r.duration || 0) / 60)) };
+    }
+    case "heartRate": {
+      const resting = parseFloat(latest.heart_rate || latest.resting_hr || latest.min || 58);
+      const max = parseFloat(latest.max || latest.peak_hr || 174);
+      const hrv = parseFloat(latest.hrv || latest.heart_rate_variability || 62);
+      return { resting, max, hrv, unit: "bpm", trend: calcTrend(rows, "heart_rate"), weekly: rows.slice(-7).map(r => parseFloat(r.heart_rate || r.resting_hr || 0)) };
+    }
+    case "spO2": {
+      const val = parseFloat(latest.spo2 || latest.oxygen_saturation || latest.value || 98);
+      return { value: val, unit: "%", trend: "Stable", low: 95 };
+    }
+    case "stress": {
+      const val = parseFloat(latest.stress_score || latest.stress || latest.value || 32);
+      return { value: val, unit: "/ 100", label: val < 40 ? "Low" : val < 70 ? "Medium" : "High", trend: calcTrend(rows, "stress_score") };
+    }
+    case "sleep": {
+      const total = parseFloat(latest.total || latest.sleep_duration || 7.9);
+      const deep = parseFloat(latest.deep || latest.deep_sleep || 1.7);
+      const rem = parseFloat(latest.rem || latest.rem_sleep || 1.9);
+      const light = total - deep - rem;
+      return {
+        total: `${Math.floor(total)}h ${Math.round((total % 1) * 60)}m`,
+        bedtime: latest.start_time || "22:41",
+        wakeup: latest.end_time || "06:35",
+        stages: {
+          deep:  { duration: `${Math.floor(deep)}h ${Math.round((deep%1)*60)}m`, pct: Math.round(deep/total*100), color: "#2563eb" },
+          light: { duration: `${Math.floor(Math.max(0,light))}h ${Math.round((Math.max(0,light)%1)*60)}m`, pct: Math.round(Math.max(0,light)/total*100), color: "#60a5fa" },
+          rem:   { duration: `${Math.floor(rem)}h ${Math.round((rem%1)*60)}m`, pct: Math.round(rem/total*100), color: "#a78bfa" },
+          awake: { duration: "0h 27m", pct: Math.max(0, 100 - Math.round(deep/total*100) - Math.round(Math.max(0,light)/total*100) - Math.round(rem/total*100)), color: "#374151" },
+        },
+        trend: "+18 min vs avg"
+      };
+    }
+    case "bloodPressure": {
+      const sys = parseFloat(latest.systolic || latest.blood_pressure_systolic || 118);
+      const dia = parseFloat(latest.diastolic || latest.blood_pressure_diastolic || 76);
+      return { systolic: sys, diastolic: dia, unit: "mmHg", status: sys < 120 ? "Optimal" : sys < 130 ? "Normal" : "Elevated" };
+    }
+    case "bodyComposition": {
+      return {
+        weight: parseFloat(latest.weight || latest.body_weight || 82.4),
+        bodyFat: parseFloat(latest.body_fat || latest.fat_percentage || 14.2),
+        muscleMass: parseFloat(latest.muscle_mass || latest.skeletal_muscle || 68.4),
+        boneMass: parseFloat(latest.bone_mass || 3.1),
+        water: parseFloat(latest.body_water || latest.water_percentage || 62.5),
+        bmi: parseFloat(latest.bmi || 22.8),
+        trend: "+0.3 kg muscle this month"
+      };
+    }
+    case "ecg": {
+      return {
+        rhythm: latest.rhythm || "Normal Sinus Rhythm",
+        rate: latest.rate || `${latest.heart_rate || 58} bpm`,
+        qt: latest.qt_interval || "382 ms",
+        pr: latest.pr_interval || "156 ms",
+        qrs: latest.qrs_duration || "88 ms",
+        notes: latest.notes || "Athlete bradycardia noted. No abnormalities detected.",
+        tags: ["NSR", "No abnormalities", "QT normal"]
+      };
+    }
+    case "menstrual": {
+      const day = parseInt(latest.cycle_day || latest.day || 12);
+      const length = parseInt(latest.cycle_length || latest.length || 28);
+      const phase = latest.cycle_phase || latest.phase || "Follicular";
+      return { day, length, phase, next: `~${length - day} days`, note: "Estrogen rising — high-intensity window." };
+    }
+    case "sleepApnea": {
+      const ahi = parseFloat(latest.ahi || latest.apnea_hypopnea_index || 4.1);
+      return { ahi, status: ahi < 5 ? "Normal" : ahi < 15 ? "Mild" : ahi < 30 ? "Moderate" : "Severe", events: parseInt(latest.events || 32), o2drop: latest.o2_drop || "3%" };
+    }
+    case "antioxidant": {
+      const val = parseFloat(latest.carotenoid || latest.antioxidant || latest.value || 42);
+      return { value: val, unit: "μmol/L", range: { low: 20, high: 60 }, status: val > 35 ? "Good" : val > 20 ? "Fair" : "Low" };
+    }
+    case "energyScore": {
+      const val = parseFloat(latest.energy_score || latest.energy || latest.value || 84);
+      return { value: val, label: val >= 80 ? "Excellent" : val >= 65 ? "Good" : val >= 45 ? "Fair" : "Poor", breakdown: { sleep: parseFloat(latest.sleep_score || 88), hrv: parseFloat(latest.hrv_score || 79), activity: parseFloat(latest.activity_score || 85) } };
+    }
+    case "fallDetection": {
+      const incidents = parseInt(latest.fall_count || latest.incidents || 0);
+      return { incidents, status: incidents === 0 ? "Clear" : "Alert", lastCheck: latest.last_check || "Today", note: incidents === 0 ? "No incidents in last 30 days." : `${incidents} incident(s) detected.` };
+    }
+    default: return null;
+  }
+}
+
+function calcTrend(rows, key) {
+  if (rows.length < 2) return "Stable";
+  const recent = parseFloat(rows[rows.length - 1][key] || 0);
+  const prev = parseFloat(rows[rows.length - 2][key] || 0);
+  if (!prev) return "Stable";
+  const pct = Math.round(((recent - prev) / prev) * 100);
+  return pct > 0 ? `+${pct}% vs prev` : pct < 0 ? `${pct}% vs prev` : "Stable";
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  DEMO DATA (shown before CSV upload)
+// ═══════════════════════════════════════════════════════════════
+
+const DEMO = {
+  steps:          { value: 11240, goal: 15000, unit: "steps", trend: "+6% vs avg", weekly: [8200, 11240, 7600, 13100, 9800, 6500, 10300] },
+  calories:       { value: 2810, goal: 3200, unit: "kcal", trend: "−3% vs avg", weekly: [2600, 2810, 2400, 3100, 2900, 2200, 2750] },
+  activeMinutes:  { value: 68, goal: 90, unit: "min", trend: "+12 min vs avg", weekly: [52, 71, 45, 90, 68, 33, 61] },
+  heartRate:      { resting: 58, max: 174, hrv: 62, unit: "bpm", trend: "↓ 2 bpm vs last week", weekly: [60, 58, 59, 57, 58, 61, 58] },
+  ecg:            { rhythm: "Normal Sinus Rhythm", rate: "58 bpm", qt: "382 ms", pr: "156 ms", qrs: "88 ms", notes: "Athlete bradycardia noted. No abnormalities detected.", tags: ["NSR", "No abnormalities", "QT normal", "Athlete bradycardia"] },
+  spO2:           { value: 98, unit: "%", low: 95, trend: "Stable, within normal range" },
+  sleep:          { total: "7h 54m", bedtime: "22:41", wakeup: "06:35", stages: { deep: { duration: "1h 42m", pct: 21, color: "#2563eb" }, light: { duration: "3h 10m", pct: 39, color: "#60a5fa" }, rem: { duration: "1h 55m", pct: 24, color: "#a78bfa" }, awake: { duration: "0h 27m", pct: 16, color: "#374151" } }, trend: "+18 min vs avg" },
+  stress:         { value: 32, unit: "/ 100", label: "Low", trend: "Trending down — recovery effective" },
+  bodyComposition:{ weight: 82.4, bodyFat: 14.2, muscleMass: 68.4, boneMass: 3.1, water: 62.5, bmi: 22.8, trend: "+0.3 kg muscle this month" },
+  bloodPressure:  { systolic: 118, diastolic: 76, unit: "mmHg", status: "Optimal", trend: "Stable" },
+  menstrual:      { day: 12, length: 28, phase: "Follicular", next: "~16 days", note: "Peak performance window. Estrogen rising — good for high-intensity work." },
+  sleepApnea:     { ahi: 4.1, status: "Normal", events: 32, o2drop: "3%", note: "Mild variation. No clinical intervention required." },
+  antioxidant:    { value: 42, unit: "μmol/L", range: { low: 20, high: 60 }, status: "Good", trend: "Within optimal range" },
+  energyScore:    { value: 84, label: "Good", breakdown: { sleep: 88, hrv: 79, activity: 85 }, trend: "↑ 6 pts since Monday" },
+  fallDetection:  { incidents: 0, status: "Clear", lastCheck: "Today 07:42 AM", note: "No incidents in last 30 days." },
+  athlete:        { name: "Jordan Silva", initials: "JS", position: "Midfielder", number: "#14", team: "FC Northgate", date: "Feb 24, 2026 · 07:42 AM" },
+  team: [
+    { name: "Jordan Silva",  pos: "MF", energy: 84, sleep: "7h 54m", stress: "Low",    status: "Ready" },
+    { name: "Alex Torres",   pos: "FW", energy: 71, sleep: "6h 10m", stress: "Medium", status: "Monitor" },
+    { name: "Sam Okafor",    pos: "DF", energy: 55, sleep: "5h 30m", stress: "High",   status: "Risk" },
+    { name: "Casey Lin",     pos: "GK", energy: 90, sleep: "8h 20m", stress: "Low",    status: "Ready" },
+    { name: "Morgan Webb",   pos: "MF", energy: 78, sleep: "7h 05m", stress: "Low",    status: "Ready" },
+    { name: "Riley Park",    pos: "FW", energy: 63, sleep: "6h 45m", stress: "Medium", status: "Monitor" },
+  ],
+  alerts: {
+    coach:   { type: "warn", text: "Sam Okafor: High stress + poor sleep — recommend reduced load today." },
+    trainer: { type: "info", text: "Resting HR trended down 4 bpm this week — recovery improving." },
+    doctor:  { type: "warn", text: "SpO₂ stable. Antioxidant index borderline — consider dietary review." },
+    athlete: { type: "ok",   text: "You're in great shape today. Energy 84 — ideal for high-intensity training." },
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  DESIGN TOKENS
+// ═══════════════════════════════════════════════════════════════
+
+const T = {
+  bg: "#07090f", surf: "#0e1219", surf2: "#141b27", surf3: "#1c2535",
+  border: "#1e2d42", border2: "#253447",
+  teal: "#00d9b8", blue: "#3b82f6", violet: "#8b5cf6", rose: "#f43f5e",
+  amber: "#f59e0b", orange: "#f97316", sky: "#38bdf8", lime: "#84cc16",
+  pink: "#ec4899", emerald: "#10b981",
+  text: "#dde4f0", text2: "#8fa3be", text3: "#4d6380",
+  ok: "#10b981", warn: "#f59e0b", danger: "#f43f5e",
+};
+const METRIC_COLOR = {
+  steps: T.teal, calories: T.rose, activeMinutes: T.amber, heartRate: T.rose,
+  ecg: T.teal, spO2: T.sky, sleep: T.blue, stress: T.violet,
+  bodyComposition: T.lime, bloodPressure: T.pink, menstrual: T.violet,
+  sleepApnea: T.orange, antioxidant: T.orange, energyScore: T.teal, fallDetection: T.emerald,
+};
+const css = {
+  card: { background: T.surf, border: `1px solid ${T.border}`, borderRadius: 14, padding: "18px 20px", position: "relative", overflow: "hidden", transition: "transform 0.2s, border-color 0.2s", cursor: "default" },
+  panel: { background: T.surf, border: `1px solid ${T.border}`, borderRadius: 14, padding: "20px 22px", marginBottom: 14 },
+  label: { fontSize: "0.6rem", letterSpacing: "0.14em", textTransform: "uppercase", color: T.text3, marginBottom: 6 },
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  COMPONENTS
+// ═══════════════════════════════════════════════════════════════
+
+function MetricCard({ k, label, value, unit, trend, dir = "neutral", pct = 0, icon, accentColor }) {
+  const c = accentColor || METRIC_COLOR[k] || T.teal;
+  const [hov, setHov] = useState(false);
+  const arrow = dir === "up" ? "▲" : dir === "down" ? "▼" : "—";
+  const arrColor = dir === "up" ? T.ok : dir === "down" ? T.danger : T.text3;
+  return (
+    <div
+      style={{ ...css.card, borderColor: hov ? c : T.border, transform: hov ? "translateY(-3px)" : "none" }}
+      onMouseEnter={() => setHov(true)} onMouseLeave={() => setHov(false)}
+    >
+      <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 2, background: c }} />
+      <div style={{ position: "absolute", top: 14, right: 14, fontSize: "1.1rem", opacity: 0.15 }}>{icon}</div>
+      <div style={css.label}>{label}</div>
+      <div style={{ fontFamily: "'Bebas Neue', Impact, sans-serif", fontSize: "2.4rem", lineHeight: 1, color: c, marginBottom: 2 }}>{value}</div>
+      <div style={{ fontSize: "0.68rem", color: T.text3, marginBottom: 8 }}>{unit}</div>
+      <div style={{ fontSize: "0.66rem", color: T.text2, display: "flex", alignItems: "center", gap: 4 }}>
+        <span style={{ color: arrColor }}>{arrow}</span>&nbsp;{trend}
+      </div>
+      <div style={{ height: 3, borderRadius: 2, background: T.border2, marginTop: 12, overflow: "hidden" }}>
+        <div style={{ height: "100%", borderRadius: 2, background: c, width: `${Math.min(100, Math.max(0, pct))}%`, transition: "width 1s cubic-bezier(0.16,1,0.3,1)" }} />
+      </div>
+    </div>
+  );
+}
+
+function AlertBanner({ type, text }) {
+  const styles = {
+    ok:   { bg: "rgba(16,185,129,0.08)", border: T.ok,     color: "#34d399", icon: "✓" },
+    info: { bg: "rgba(0,217,184,0.07)",  border: T.teal,   color: T.teal,   icon: "ℹ" },
+    warn: { bg: "rgba(244,63,94,0.08)",  border: T.danger, color: "#fb7185", icon: "⚠" },
+  };
+  const s = styles[type] || styles.info;
+  return (
+    <div style={{ padding: "11px 16px", borderRadius: 8, marginBottom: 20, fontSize: "0.75rem", fontWeight: 500, display: "flex", alignItems: "center", gap: 8, borderLeft: `3px solid ${s.border}`, background: s.bg, color: s.color }}>
+      {s.icon} {text}
+    </div>
+  );
+}
+
+function ViewTitle({ line1, accent, sub, date }) {
+  return (
+    <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", marginBottom: 20 }}>
+      <div>
+        <h1 style={{ fontFamily: "'Bebas Neue', Impact, sans-serif", fontSize: "3rem", letterSpacing: "0.08em", lineHeight: 1, color: T.text }}>
+          {line1} <span style={{ color: T.teal }}>{accent}</span>
+        </h1>
+        <p style={{ fontSize: "0.7rem", color: T.text3, marginTop: 4 }}>{sub}</p>
+      </div>
+      <div style={{ fontSize: "0.68rem", color: T.text3 }}>{date}</div>
+    </div>
+  );
+}
+
+function PanelTitle({ children }) {
+  return (
+    <div style={{ ...css.label, marginBottom: 16, display: "flex", alignItems: "center", gap: 8 }}>
+      {children}
+      <div style={{ flex: 1, height: 1, background: T.border }} />
+    </div>
+  );
+}
+
+function SleepPanel({ sleep }) {
+  if (!sleep) return null;
+  const order = ["deep", "light", "rem", "awake"];
+  return (
+    <div style={css.panel}>
+      <PanelTitle>Sleep Architecture · {sleep.total}</PanelTitle>
+      <div style={{ display: "flex", height: 32, borderRadius: 8, overflow: "hidden", gap: 2, marginBottom: 12 }}>
+        {order.map(k => {
+          const s = sleep.stages[k] || {};
+          return (
+            <div key={k} style={{ flex: s.pct || 0, background: s.color || "#374151", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "0.6rem", color: "rgba(255,255,255,0.7)", letterSpacing: "0.05em" }}>
+              {(s.pct || 0) > 10 ? k.toUpperCase() : ""}
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ display: "flex", gap: 18, flexWrap: "wrap" }}>
+        {order.map(k => {
+          const s = sleep.stages[k] || {};
+          return (
+            <div key={k} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "0.68rem", color: T.text2 }}>
+              <div style={{ width: 9, height: 9, borderRadius: 3, background: s.color || "#374151" }} />
+              {k.charAt(0).toUpperCase() + k.slice(1)} · {s.duration || "—"}
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ marginTop: 12, fontSize: "0.68rem", color: T.text2 }}>
+        Bed {sleep.bedtime} → Wake {sleep.wakeup} &nbsp;·&nbsp;
+        <span style={{ color: T.ok }}>▲</span> {sleep.trend}
+      </div>
+    </div>
+  );
+}
+
+function EcgPanel({ ecg }) {
+  if (!ecg) return null;
+  const W = 600, H = 56, mid = H / 2, sw = W / 4;
+  let d = `M0,${mid}`;
+  for (let i = 0; i < 4; i++) {
+    const x = i * sw;
+    d += ` L${x+18},${mid} Q${x+26},${mid-5} ${x+33},${mid} L${x+43},${mid} L${x+48},${mid+4} L${x+53},4 L${x+58},${mid+9} L${x+63},${mid} Q${x+76},${mid-10} ${x+92},${mid} L${x+sw},${mid}`;
+  }
+  const kvs = [["Rhythm", ecg.rhythm], ["Rate", ecg.rate], ["QT", ecg.qt], ["PR", ecg.pr], ["QRS", ecg.qrs]];
+  return (
+    <div style={css.panel}>
+      <PanelTitle>ECG · Last Reading</PanelTitle>
+      <div style={{ height: 56, width: "100%", overflow: "hidden" }}>
+        <svg viewBox="0 0 600 56" preserveAspectRatio="none" style={{ width: "100%", height: "100%" }}>
+          <path d={d} stroke={T.teal} fill="none" strokeWidth="4" opacity="0.12" />
+          <path d={d} stroke={T.teal} fill="none" strokeWidth="1.6" />
+        </svg>
+      </div>
+      <div style={{ display: "flex", gap: 24, flexWrap: "wrap", marginTop: 14 }}>
+        {kvs.map(([l, v]) => (
+          <div key={l}>
+            <div style={{ fontSize: "0.58rem", letterSpacing: "0.1em", textTransform: "uppercase", color: T.text3, marginBottom: 2 }}>{l}</div>
+            <div style={{ fontFamily: "'Bebas Neue', Impact, sans-serif", fontSize: "1rem", color: T.teal }}>{v}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 12 }}>
+        {(ecg.tags || []).map(t => (
+          <span key={t} style={{ fontSize: "0.6rem", letterSpacing: "0.06em", textTransform: "uppercase", padding: "3px 10px", borderRadius: 20, border: `1px solid ${T.border2}`, color: T.text3 }}>{t}</span>
+        ))}
+      </div>
+      <div style={{ marginTop: 10, fontSize: "0.68rem", color: T.text2 }}>{ecg.notes}</div>
+    </div>
+  );
+}
+
+function Sparkline({ values = [], label }) {
+  if (!values.length) return null;
+  const W = 520, H = 60, pad = 20;
+  const max = Math.max(...values, 1);
+  const days = ["M", "T", "W", "T", "F", "S", "S"];
+  const pts = values.map((v, i) => ({
+    x: pad + i * ((W - pad * 2) / (values.length - 1)),
+    y: H - pad - (v / max) * (H - pad * 1.4), v, d: days[i]
+  }));
+  const line = pts.map((p, i) => `${i ? "L" : "M"}${p.x},${p.y}`).join(" ");
+  const area = `${line} L${pts[pts.length - 1].x},${H} L${pts[0].x},${H} Z`;
+  return (
+    <div style={css.panel}>
+      <PanelTitle>{label}</PanelTitle>
+      <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ width: "100%", height: 70 }}>
+        <defs>
+          <linearGradient id={`g_${label}`} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={T.teal} stopOpacity="0.25" />
+            <stop offset="100%" stopColor={T.teal} stopOpacity="0" />
+          </linearGradient>
+        </defs>
+        <path d={area} fill={`url(#g_${label})`} />
+        <path d={line} stroke={T.teal} fill="none" strokeWidth="1.8" strokeLinejoin="round" />
+        {pts.map((p, i) => (
+          <g key={i}>
+            <circle cx={p.x} cy={p.y} r="3" fill={T.teal} />
+            <text x={p.x} y={H - 3} textAnchor="middle" fill={T.text3} fontSize="8" fontFamily="IBM Plex Mono">{p.d}</text>
+            <text x={p.x} y={p.y - 7} textAnchor="middle" fill={T.text} fontSize="7.5" fontFamily="IBM Plex Mono">{p.v}</text>
+          </g>
+        ))}
+      </svg>
+    </div>
+  );
+}
+
+function EnergyRing({ score, label, trend, breakdown }) {
+  const r = 42, circ = 2 * Math.PI * r, off = circ * (1 - (score || 0) / 100);
+  return (
+    <div style={css.panel}>
+      <PanelTitle>Energy Score</PanelTitle>
+      <div style={{ display: "flex", alignItems: "center", gap: 24 }}>
+        <div style={{ position: "relative", width: 100, height: 100, flexShrink: 0 }}>
+          <svg viewBox="0 0 100 100" width="100" height="100" style={{ transform: "rotate(-90deg)" }}>
+            <circle cx="50" cy="50" r={r} stroke={T.surf3} fill="none" strokeWidth="8" />
+            <circle cx="50" cy="50" r={r} stroke={T.teal} fill="none" strokeWidth="8"
+              strokeDasharray={circ.toFixed(2)} strokeDashoffset={off.toFixed(2)} strokeLinecap="round" />
+          </svg>
+          <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", fontFamily: "'Bebas Neue', Impact, sans-serif", fontSize: "1.8rem", color: T.teal }}>
+            {score}
+            <small style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "0.55rem", color: T.text3, textTransform: "uppercase", letterSpacing: "0.1em" }}>/ 100</small>
+          </div>
+        </div>
+        <div>
+          <div style={{ fontFamily: "'Bebas Neue', Impact, sans-serif", fontSize: "1.3rem", color: T.text, letterSpacing: "0.04em" }}>{label}</div>
+          <div style={{ fontSize: "0.68rem", color: T.text2, marginTop: 4 }}>{trend}</div>
+          {breakdown && (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginTop: 14, textAlign: "center" }}>
+              {[["Sleep", breakdown.sleep, T.blue], ["HRV", breakdown.hrv, T.violet], ["Activity", breakdown.activity, T.teal]].map(([l, v, c]) => (
+                <div key={l}>
+                  <div style={{ fontFamily: "'Bebas Neue', Impact, sans-serif", fontSize: "1.2rem", color: c }}>{v}</div>
+                  <div style={{ fontSize: "0.58rem", color: T.text3, textTransform: "uppercase", letterSpacing: "0.08em" }}>{l}</div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AhiScale({ ap }) {
+  if (!ap) return null;
+  const pct = Math.min(98, Math.round((ap.ahi || 0) / 40 * 100));
+  const c = ap.ahi < 5 ? T.ok : ap.ahi < 15 ? T.warn : T.danger;
+  return (
+    <div style={css.panel}>
+      <PanelTitle>Sleep Apnea — AHI Scale</PanelTitle>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 16, marginBottom: 14 }}>
+        {[["AHI", ap.ahi, "events/hr", c], ["Status", ap.status, "", c], ["Events", ap.events, "total", T.teal], ["O₂ Drop", ap.o2drop, "avg desat", T.sky]].map(([l, v, u, col]) => (
+          <div key={l}>
+            <div style={{ fontSize: "0.58rem", letterSpacing: "0.1em", textTransform: "uppercase", color: T.text3, marginBottom: 5 }}>{l}</div>
+            <div style={{ fontFamily: "'Bebas Neue', Impact, sans-serif", fontSize: "1.7rem", color: col }}>{v || "—"}</div>
+            <div style={{ fontSize: "0.62rem", color: T.text3 }}>{u}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{ position: "relative", height: 10, borderRadius: 5, marginBottom: 20, background: `linear-gradient(90deg, ${T.ok} 0%, ${T.ok} 33%, ${T.warn} 33%, ${T.warn} 55%, ${T.orange} 55%, ${T.orange} 77%, ${T.danger} 77%)` }}>
+        <div style={{ position: "absolute", top: -16, left: `${pct}%`, transform: "translateX(-50%)", fontFamily: "'Bebas Neue',Impact,sans-serif", fontSize: "0.85rem", color: T.text }}>
+          {ap.ahi}
+          <div style={{ width: 2, height: 22, background: "#fff", margin: "2px auto 0" }} />
+        </div>
+      </div>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.58rem", color: T.text3, marginBottom: 12 }}>
+        <span>0 — Normal ({"<"}5)</span><span>5 — Mild</span><span>15 — Moderate</span><span>30+ — Severe</span>
+      </div>
+      <div style={{ background: T.surf2, borderRadius: 8, padding: "10px 14px", border: `1px solid ${T.border}`, fontSize: "0.68rem", color: T.text2 }}>
+        📋 {ap.note}
+      </div>
+    </div>
+  );
+}
+
+function StatusPill({ text }) {
+  const cfg = text === "Ready" ? { bg: "rgba(16,185,129,0.12)", color: "#34d399" } :
+               text === "Monitor" ? { bg: "rgba(245,158,11,0.12)", color: "#fbbf24" } :
+               text === "Risk" ? { bg: "rgba(244,63,94,0.12)", color: "#fb7185" } :
+               { bg: "rgba(16,185,129,0.12)", color: "#34d399" };
+  return <span style={{ display: "inline-block", padding: "2px 10px", borderRadius: 20, fontSize: "0.6rem", letterSpacing: "0.06em", fontWeight: 500, ...cfg }}>{text}</span>;
+}
+
+function StatusBadge({ s }) {
+  const ok = ["Normal","Good","Optimal","Excellent","Clear","Low","Active","Tracked","Athletic","Above avg"];
+  const warn = ["Elevated","Medium","Monitor","Fair"];
+  const cfg = ok.includes(s) ? { bg: "rgba(16,185,129,0.12)", color: "#34d399" } :
+              warn.includes(s) ? { bg: "rgba(245,158,11,0.12)", color: "#fbbf24" } :
+              { bg: "rgba(244,63,94,0.12)", color: "#fb7185" };
+  return <span style={{ display: "inline-block", padding: "2px 10px", borderRadius: 20, fontSize: "0.6rem", letterSpacing: "0.06em", fontWeight: 500, ...cfg }}>{s}</span>;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  4 ROLE VIEWS
+// ═══════════════════════════════════════════════════════════════
+
+function CoachView({ d }) {
+  const pct = (v, g) => Math.round((v / g) * 100);
+  return (
+    <div>
+      <ViewTitle line1="COACH" accent="OVERVIEW" sub="Performance readiness at a glance" date={d.athlete.date} />
+      <AlertBanner {...d.alerts.coach} />
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(200px,1fr))", gap: 12, marginBottom: 20 }}>
+        <MetricCard k="energyScore" label="Energy Score" value={d.energyScore.value} unit={d.energyScore.label} trend={d.energyScore.trend || ""} dir="up" pct={d.energyScore.value} icon="⚡" />
+        <MetricCard k="heartRate" label="Resting HR" value={d.heartRate.resting} unit={d.heartRate.unit} trend={d.heartRate.trend} dir="up" pct={100 - pct(d.heartRate.resting, 80)} icon="❤️" />
+        <MetricCard k="steps" label="Daily Steps" value={d.steps.value.toLocaleString()} unit={d.steps.unit} trend={d.steps.trend} dir="up" pct={pct(d.steps.value, d.steps.goal)} icon="🦶" />
+        <MetricCard k="activeMinutes" label="Active Minutes" value={d.activeMinutes.value} unit={d.activeMinutes.unit} trend={d.activeMinutes.trend} dir="up" pct={pct(d.activeMinutes.value, d.activeMinutes.goal)} icon="⚡" />
+        <MetricCard k="stress" label="Stress Level" value={d.stress.value} unit={`${d.stress.unit} — ${d.stress.label}`} trend={d.stress.trend} dir="up" pct={d.stress.value} icon="🧘" />
+        <MetricCard k="sleep" label="Total Sleep" value={d.sleep.total} unit="last night" trend={d.sleep.trend} dir="up" pct={87} icon="🌙" />
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+        <SleepPanel sleep={d.sleep} />
+        <div style={css.panel}>
+          <PanelTitle>Team Readiness Snapshot</PanelTitle>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead>
+              <tr>
+                {["Athlete","Pos","Energy","Sleep","Stress","Status"].map(h => (
+                  <th key={h} style={{ fontSize: "0.58rem", letterSpacing: "0.12em", textTransform: "uppercase", color: T.text3, padding: "8px 12px", textAlign: "left", borderBottom: `1px solid ${T.border}` }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {d.team.map((p, i) => {
+                const bc = p.energy >= 80 ? T.ok : p.energy >= 65 ? T.warn : T.danger;
+                const sc = p.stress === "Low" ? T.ok : p.stress === "Medium" ? T.warn : T.danger;
+                return (
+                  <tr key={i} style={{ borderBottom: `1px solid rgba(30,45,66,0.5)` }}>
+                    <td style={{ padding: "11px 12px", fontWeight: 500 }}>{p.name}</td>
+                    <td style={{ padding: "11px 12px", color: T.text3 }}>{p.pos}</td>
+                    <td style={{ padding: "11px 12px" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                        <div style={{ width: 52, height: 3, background: T.border2, borderRadius: 2, overflow: "hidden" }}>
+                          <div style={{ width: `${p.energy}%`, height: "100%", background: bc, borderRadius: 2 }} />
+                        </div>
+                        <span style={{ fontFamily: "'Bebas Neue',Impact,sans-serif", fontSize: "0.9rem", color: bc }}>{p.energy}</span>
+                      </div>
+                    </td>
+                    <td style={{ padding: "11px 12px", color: T.text2, fontSize: "0.75rem" }}>{p.sleep}</td>
+                    <td style={{ padding: "11px 12px", color: sc, fontSize: "0.75rem" }}>{p.stress}</td>
+                    <td style={{ padding: "11px 12px" }}><StatusPill text={p.status} /></td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TrainerView({ d }) {
+  const pct = (v, g) => Math.min(100, Math.round((v / g) * 100));
+  const bc = d.bodyComposition;
+  const compRows = [
+    ["Body Weight", `${bc.weight} kg`, bc.weight / 100 * 82, T.teal],
+    ["Body Fat",    `${bc.bodyFat}%`,  bc.bodyFat,             T.rose],
+    ["Muscle Mass", `${bc.muscleMass} kg`, bc.muscleMass / 100 * 90, T.lime],
+    ["Bone Mass",   `${bc.boneMass} kg`,  bc.boneMass / 5 * 100, T.sky],
+    ["Body Water",  `${bc.water}%`,    bc.water,               T.blue],
+    ["BMI",         bc.bmi,            bc.bmi / 30 * 100,      T.amber],
+  ];
+  return (
+    <div>
+      <ViewTitle line1="TRAINER" accent="LOAD & RECOVERY" sub="Physical conditioning metrics" date={d.athlete.date} />
+      <AlertBanner {...d.alerts.trainer} />
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(200px,1fr))", gap: 12, marginBottom: 20 }}>
+        <MetricCard k="steps" label="Daily Steps" value={d.steps.value.toLocaleString()} unit={d.steps.unit} trend={d.steps.trend} dir="up" pct={pct(d.steps.value, d.steps.goal)} icon="🦶" />
+        <MetricCard k="calories" label="Calories Burned" value={d.calories.value.toLocaleString()} unit={d.calories.unit} trend={d.calories.trend} dir="down" pct={pct(d.calories.value, d.calories.goal)} icon="🔥" />
+        <MetricCard k="activeMinutes" label="Active Minutes" value={d.activeMinutes.value} unit={d.activeMinutes.unit} trend={d.activeMinutes.trend} dir="up" pct={pct(d.activeMinutes.value, d.activeMinutes.goal)} icon="⚡" />
+        <MetricCard k="heartRate" label="Resting HR" value={d.heartRate.resting} unit="bpm" trend={d.heartRate.trend} dir="up" pct={100 - pct(d.heartRate.resting, 80)} icon="❤️" />
+        <MetricCard k="heartRate" label="Peak HR" value={d.heartRate.max} unit="bpm max" trend="Session peak" dir="neutral" pct={pct(d.heartRate.max, 200)} icon="💓" />
+        <MetricCard k="fallDetection" label="Fall Detection" value={d.fallDetection.incidents === 0 ? "Clear" : d.fallDetection.incidents} unit={d.fallDetection.incidents === 0 ? "No incidents" : "incidents"} trend={d.fallDetection.note} dir="up" pct={100} icon="🛡️" />
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+        <Sparkline values={d.activeMinutes.weekly || []} label="Weekly Active Minutes (Mon → Sun)" />
+        <Sparkline values={(d.steps.weekly || []).map(v => Math.round(v / 100) * 100)} label="Weekly Steps (Mon → Sun)" />
+      </div>
+      <div style={css.panel}>
+        <PanelTitle>Body Composition</PanelTitle>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(160px,1fr))", gap: 16 }}>
+          {compRows.map(([label, val, p, color]) => (
+            <div key={label}>
+              <div style={{ fontSize: "0.6rem", letterSpacing: "0.1em", textTransform: "uppercase", color: T.text3, marginBottom: 6 }}>{label}</div>
+              <div style={{ fontFamily: "'Bebas Neue',Impact,sans-serif", fontSize: "1.6rem", lineHeight: 1, color, marginBottom: 8 }}>{val}</div>
+              <div style={{ height: 3, borderRadius: 2, background: T.border2, overflow: "hidden" }}>
+                <div style={{ height: "100%", borderRadius: 2, background: color, width: `${Math.min(100, Math.max(0, p))}%` }} />
+              </div>
+            </div>
+          ))}
+        </div>
+        <div style={{ marginTop: 14, fontSize: "0.68rem", color: T.text2 }}>📈 {bc.trend}</div>
+      </div>
+    </div>
+  );
+}
+
+function DoctorView({ d }) {
+  const pct = (v, g) => Math.round((v / g) * 100);
+  return (
+    <div>
+      <ViewTitle line1="MEDICAL" accent="DASHBOARD" sub="Clinical & physiological indicators" date={d.athlete.date} />
+      <AlertBanner {...d.alerts.doctor} />
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(200px,1fr))", gap: 12, marginBottom: 20 }}>
+        <MetricCard k="bloodPressure" label="Blood Pressure" value={`${d.bloodPressure.systolic}/${d.bloodPressure.diastolic}`} unit={`${d.bloodPressure.unit} — ${d.bloodPressure.status}`} trend="Stable" dir="neutral" pct={62} icon="🩺" />
+        <MetricCard k="heartRate" label="Resting HR" value={d.heartRate.resting} unit="bpm" trend={d.heartRate.trend} dir="up" pct={100 - pct(d.heartRate.resting, 80)} icon="❤️" />
+        <MetricCard k="spO2" label="Blood Oxygen (SpO₂)" value={d.spO2.value} unit={d.spO2.unit} trend={d.spO2.trend} dir="neutral" pct={d.spO2.value} icon="🩸" />
+        <MetricCard k="antioxidant" label="Antioxidant Index" value={d.antioxidant.value} unit={`${d.antioxidant.unit} — ${d.antioxidant.status}`} trend={d.antioxidant.trend || ""} dir="neutral" pct={Math.round(d.antioxidant.value / d.antioxidant.range.high * 100)} icon="🍊" />
+        <MetricCard k="stress" label="Stress Level" value={d.stress.value} unit={`${d.stress.unit} — ${d.stress.label}`} trend={d.stress.trend} dir="up" pct={d.stress.value} icon="🧘" />
+        <MetricCard k="menstrual" label="Menstrual Cycle" value={`Day ${d.menstrual.day}`} unit={`of ${d.menstrual.length}-day cycle`} trend={`${d.menstrual.phase} · next ${d.menstrual.next}`} dir="neutral" pct={Math.round(d.menstrual.day / d.menstrual.length * 100)} icon="🌙" />
+      </div>
+      <EcgPanel ecg={d.ecg} />
+      <AhiScale ap={d.sleepApnea} />
+      <div style={css.panel}>
+        <PanelTitle>Menstrual Cycle — Clinical Note</PanelTitle>
+        <div style={{ display: "inline-flex", alignItems: "center", gap: 8, background: "rgba(139,92,246,0.12)", border: `1px solid rgba(139,92,246,0.25)`, borderRadius: 30, padding: "8px 18px", fontSize: "0.72rem", color: "#c4b5fd", marginBottom: 12 }}>
+          <div style={{ width: 8, height: 8, borderRadius: "50%", background: T.violet }} />
+          {d.menstrual.phase} Phase · Day {d.menstrual.day} of {d.menstrual.length}
+        </div>
+        <div style={{ fontSize: "0.72rem", color: T.text2, lineHeight: 1.7 }}>{d.menstrual.note}</div>
+      </div>
+    </div>
+  );
+}
+
+function AthleteView({ d }) {
+  const pct = (v, g) => Math.min(100, Math.round((v / g) * 100));
+  const rows = [
+    ["Steps", d.steps.value.toLocaleString(), d.steps.unit, "Normal"],
+    ["Calories", d.calories.value.toLocaleString(), d.calories.unit, "Normal"],
+    ["Active Minutes", d.activeMinutes.value, d.activeMinutes.unit, "Active"],
+    ["Resting HR", d.heartRate.resting, "bpm", "Athletic"],
+    ["Peak HR", d.heartRate.max, "bpm max", "Normal"],
+    ["HRV", d.heartRate.hrv, "ms", "Good"],
+    ["Blood Pressure", `${d.bloodPressure.systolic}/${d.bloodPressure.diastolic}`, d.bloodPressure.unit, d.bloodPressure.status],
+    ["ECG Rhythm", d.ecg.rhythm, d.ecg.rate, "Normal"],
+    ["Blood Oxygen (SpO₂)", d.spO2.value, d.spO2.unit, "Excellent"],
+    ["Stress Level", d.stress.value, `/ 100 — ${d.stress.label}`, "Low"],
+    ["Energy Score", d.energyScore.value, `/ 100 — ${d.energyScore.label}`, "Good"],
+    ["Antioxidant Index", d.antioxidant.value, d.antioxidant.unit, d.antioxidant.status],
+    ["Body Weight", d.bodyComposition.weight, "kg", "Normal"],
+    ["Body Fat", d.bodyComposition.bodyFat, "%", "Athletic"],
+    ["Muscle Mass", d.bodyComposition.muscleMass, "kg", "Good"],
+    ["BMI", d.bodyComposition.bmi, "kg/m²", "Normal"],
+    ["Total Sleep", d.sleep.total, `${d.sleep.bedtime} → ${d.sleep.wakeup}`, "Good"],
+    ["Deep Sleep", d.sleep.stages.deep.duration, `${d.sleep.stages.deep.pct}% of night`, "Normal"],
+    ["REM Sleep", d.sleep.stages.rem.duration, `${d.sleep.stages.rem.pct}% of night`, "Normal"],
+    ["Sleep Apnea AHI", d.sleepApnea.ahi, "events/hr", d.sleepApnea.status],
+    ["Menstrual Cycle", `Day ${d.menstrual.day}`, `${d.menstrual.phase} phase`, "Tracked"],
+    ["Fall Detection", d.fallDetection.incidents === 0 ? "Clear" : d.fallDetection.incidents, "last 30 days", "Clear"],
+  ];
+  return (
+    <div>
+      <ViewTitle line1="MY" accent="STATS" sub="Your complete health snapshot" date={d.athlete.date} />
+      <AlertBanner {...d.alerts.athlete} />
+      <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: 16, marginBottom: 16, alignItems: "start" }}>
+        <EnergyRing score={d.energyScore.value} label={d.energyScore.label} trend={d.energyScore.trend || ""} breakdown={d.energyScore.breakdown} />
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(180px,1fr))", gap: 12 }}>
+          <MetricCard k="steps" label="Steps" value={d.steps.value.toLocaleString()} unit={d.steps.unit} trend={d.steps.trend} dir="up" pct={pct(d.steps.value, d.steps.goal)} icon="🦶" />
+          <MetricCard k="calories" label="Calories" value={d.calories.value.toLocaleString()} unit={d.calories.unit} trend={d.calories.trend} dir="down" pct={pct(d.calories.value, d.calories.goal)} icon="🔥" />
+          <MetricCard k="heartRate" label="Resting HR" value={d.heartRate.resting} unit="bpm" trend={d.heartRate.trend} dir="up" pct={100 - pct(d.heartRate.resting, 80)} icon="❤️" />
+          <MetricCard k="spO2" label="Blood Oxygen" value={d.spO2.value} unit={d.spO2.unit} trend={d.spO2.trend} dir="neutral" pct={d.spO2.value} icon="🩸" />
+          <MetricCard k="stress" label="Stress" value={d.stress.value} unit={d.stress.unit} trend={d.stress.label} dir="up" pct={d.stress.value} icon="🧘" />
+          <MetricCard k="activeMinutes" label="Active Min" value={d.activeMinutes.value} unit={d.activeMinutes.unit} trend={d.activeMinutes.trend} dir="up" pct={pct(d.activeMinutes.value, d.activeMinutes.goal)} icon="⚡" />
+        </div>
+      </div>
+      <SleepPanel sleep={d.sleep} />
+      <div style={css.panel}>
+        <PanelTitle>All Metrics — Full Reference</PanelTitle>
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead>
+            <tr>
+              {["Metric","Value","Detail","Status"].map(h => (
+                <th key={h} style={{ fontSize: "0.58rem", letterSpacing: "0.12em", textTransform: "uppercase", color: T.text3, padding: "8px 12px", textAlign: "left", borderBottom: `1px solid ${T.border}` }}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(([m, v, det, sta], i) => (
+              <tr key={i} style={{ borderBottom: `1px solid rgba(30,45,66,0.5)` }}>
+                <td style={{ padding: "10px 12px", fontWeight: 500, color: T.text }}>{m}</td>
+                <td style={{ padding: "10px 12px", fontFamily: "'Bebas Neue',Impact,sans-serif", fontSize: "1rem", color: T.teal }}>{v}</td>
+                <td style={{ padding: "10px 12px", color: T.text2, fontSize: "0.72rem" }}>{det}</td>
+                <td style={{ padding: "10px 12px" }}><StatusBadge s={sta} /></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  CSV UPLOAD PANEL
+// ═══════════════════════════════════════════════════════════════
+
+function UploadPanel({ onData }) {
+  const [files, setFiles] = useState([]);
+  const [dragging, setDragging] = useState(false);
+  const dropRef = useRef();
+
+  const processFiles = useCallback(async (fileList) => {
+    const results = {};
+    const loaded = [];
+    for (const file of fileList) {
+      const text = await file.text();
+      const rows = parseCSV(text);
+      if (!rows.length) continue;
+      const headers = Object.keys(rows[0]);
+      const type = detectMetricType(file.name, headers);
+      if (type !== "unknown") {
+        const val = extractMetricValue(rows, type);
+        if (val) results[type] = val;
+        loaded.push({ name: file.name, type, rows: rows.length });
+      } else {
+        loaded.push({ name: file.name, type: "unknown", rows: rows.length });
+      }
+    }
+    setFiles(loaded);
+    if (Object.keys(results).length > 0) {
+      onData({ ...DEMO, ...results });
+    }
+  }, [onData]);
+
+  const onDrop = useCallback(e => {
+    e.preventDefault(); setDragging(false);
+    processFiles([...e.dataTransfer.files].filter(f => f.name.endsWith(".csv")));
+  }, [processFiles]);
+
+  const onInput = useCallback(e => {
+    processFiles([...e.target.files]);
+  }, [processFiles]);
+
+  return (
+    <div style={{ padding: "24px 28px 0" }}>
+      <div
+        ref={dropRef}
+        onDragOver={e => { e.preventDefault(); setDragging(true); }}
+        onDragLeave={() => setDragging(false)}
+        onDrop={onDrop}
+        style={{
+          border: `2px dashed ${dragging ? T.teal : T.border2}`,
+          borderRadius: 16,
+          padding: "28px 20px",
+          textAlign: "center",
+          marginBottom: 16,
+          background: dragging ? "rgba(0,217,184,0.04)" : "transparent",
+          transition: "all 0.2s",
+          cursor: "pointer",
+        }}
+        onClick={() => document.getElementById("csv-input").click()}
+      >
+        <div style={{ fontSize: "2rem", marginBottom: 8 }}>📂</div>
+        <div style={{ fontFamily: "'Bebas Neue',Impact,sans-serif", fontSize: "1.2rem", color: T.teal, letterSpacing: "0.1em" }}>Drop Galaxy Watch CSV files here</div>
+        <div style={{ fontSize: "0.7rem", color: T.text3, marginTop: 6 }}>
+          or click to browse · accepts multiple files · auto-detects metric type
+        </div>
+        <input id="csv-input" type="file" accept=".csv" multiple style={{ display: "none" }} onChange={onInput} />
+      </div>
+      {files.length > 0 && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 16 }}>
+          {files.map((f, i) => (
+            <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, background: f.type !== "unknown" ? "rgba(0,217,184,0.08)" : "rgba(244,63,94,0.08)", border: `1px solid ${f.type !== "unknown" ? T.teal : T.danger}30`, borderRadius: 8, padding: "5px 12px", fontSize: "0.65rem" }}>
+              <span style={{ color: f.type !== "unknown" ? T.teal : T.danger }}>{f.type !== "unknown" ? "✓" : "?"}</span>
+              <span style={{ color: T.text2 }}>{f.name}</span>
+              <span style={{ color: T.text3 }}>→ {f.type} ({f.rows} rows)</span>
+            </div>
+          ))}
+        </div>
+      )}
+      <div style={{ fontSize: "0.65rem", color: T.text3, marginBottom: 16, padding: "10px 14px", background: T.surf2, borderRadius: 8, border: `1px solid ${T.border}`, lineHeight: 1.7 }}>
+        <strong style={{ color: T.text2 }}>Expected CSV filenames from Samsung Health export:</strong>{" "}
+        com.samsung.health.step_count.csv · heart_rate.csv · sleep.csv · exercise.csv · body.csv · blood_pressure.csv · spo2.csv · stress.csv · ecg.csv · menstrual.csv · body_composition.csv
+        <br />
+        <span style={{ color: T.amber }}>⚡ Demo data is shown now</span> — upload real files to see your metrics.
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  MAIN APP
+// ═══════════════════════════════════════════════════════════════
+
+const ROLES = [
+  { id: "coach",   label: "Coach",   icon: "👟", sub: "Team performance & readiness" },
+  { id: "trainer", label: "Trainer", icon: "🏋️", sub: "Load, recovery & body metrics" },
+  { id: "doctor",  label: "Doctor",  icon: "🩺", sub: "Clinical & physiological" },
+  { id: "athlete", label: "Athlete", icon: "🏃", sub: "Personal health snapshot" },
+];
+
+export default function App() {
+  const [role, setRole] = useState("coach");
+  const [data, setData] = useState(DEMO);
+  const [showUpload, setShowUpload] = useState(false);
+  const [isDemo, setIsDemo] = useState(true);
+
+  const handleData = useCallback((d) => {
+    setData(d);
+    setIsDemo(false);
+    setShowUpload(false);
+  }, []);
+
+  return (
+    <div style={{ background: T.bg, minHeight: "100vh", color: T.text, fontFamily: "IBM Plex Mono, monospace", fontSize: 13 }}>
+      {/* Scanlines overlay */}
+      <div style={{ position: "fixed", inset: 0, background: "repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(255,255,255,0.012) 2px,rgba(255,255,255,0.012) 4px)", pointerEvents: "none", zIndex: 9999 }} />
+
+      {/* Header */}
+      <header style={{ position: "sticky", top: 0, zIndex: 200, display: "flex", alignItems: "center", padding: "0 28px", height: 64, background: "rgba(7,9,15,0.94)", backdropFilter: "blur(16px)", borderBottom: `1px solid ${T.border}`, gap: 20, flexWrap: "wrap" }}>
+        <div style={{ fontFamily: "'Bebas Neue',Impact,sans-serif", fontSize: "1.7rem", letterSpacing: "0.12em", color: T.teal, whiteSpace: "nowrap" }}>
+          Vital<span style={{ color: T.text }}>Edge</span>
+        </div>
+        {isDemo && (
+          <div style={{ fontSize: "0.62rem", background: "rgba(245,158,11,0.1)", border: `1px solid ${T.amber}40`, color: T.amber, padding: "3px 12px", borderRadius: 20, letterSpacing: "0.08em" }}>
+            DEMO DATA
+          </div>
+        )}
+
+        {/* Role tabs */}
+        <div style={{ display: "flex", gap: 2, background: T.surf2, border: `1px solid ${T.border}`, borderRadius: 12, padding: 3 }}>
+          {ROLES.map(r => (
+            <button key={r.id} onClick={() => setRole(r.id)} style={{
+              fontFamily: "IBM Plex Mono, monospace", fontSize: "0.7rem", fontWeight: 500,
+              letterSpacing: "0.1em", textTransform: "uppercase", padding: "7px 18px",
+              borderRadius: 9, border: "none", cursor: "pointer",
+              background: role === r.id ? T.teal : "transparent",
+              color: role === r.id ? "#07090f" : T.text3,
+              transition: "all 0.18s",
+            }}>
+              {r.icon} {r.label}
+            </button>
+          ))}
+        </div>
+
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 12 }}>
+          <button onClick={() => setShowUpload(!showUpload)} style={{
+            fontFamily: "IBM Plex Mono, monospace", fontSize: "0.65rem", letterSpacing: "0.08em",
+            textTransform: "uppercase", padding: "7px 16px", borderRadius: 8,
+            border: `1px solid ${showUpload ? T.teal : T.border}`, background: "transparent",
+            color: showUpload ? T.teal : T.text3, cursor: "pointer", transition: "all 0.18s",
+          }}>
+            {showUpload ? "✕ Close" : "📂 Upload CSV"}
+          </button>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: "0.72rem", color: T.text2 }}>
+            <div style={{ width: 34, height: 34, background: `linear-gradient(135deg, ${T.teal}, ${T.blue})`, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Bebas Neue',Impact,sans-serif", fontSize: "0.9rem", color: "#fff" }}>
+              {data.athlete.initials}
+            </div>
+            <div>
+              <div style={{ color: T.text, fontSize: "0.78rem", fontWeight: 500 }}>{data.athlete.name}</div>
+              <div style={{ fontSize: "0.64rem", color: T.text3 }}>{data.athlete.position} · {data.athlete.number} · {data.athlete.team}</div>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      {/* Upload panel */}
+      {showUpload && <UploadPanel onData={handleData} />}
+
+      {/* Role sub-header */}
+      <div style={{ background: T.surf2, borderBottom: `1px solid ${T.border}`, padding: "8px 28px", display: "flex", alignItems: "center", gap: 16 }}>
+        {ROLES.filter(r => r.id === role).map(r => (
+          <div key={r.id} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ fontSize: "1.2rem" }}>{r.icon}</span>
+            <div>
+              <span style={{ fontFamily: "'Bebas Neue',Impact,sans-serif", fontSize: "1rem", letterSpacing: "0.1em", color: T.text }}>{r.label} View</span>
+              <span style={{ fontSize: "0.62rem", color: T.text3, marginLeft: 12 }}>{r.sub}</span>
+            </div>
+          </div>
+        ))}
+        <div style={{ marginLeft: "auto", fontSize: "0.65rem", color: T.text3 }}>Galaxy Watch 8 · {data.athlete.date}</div>
+      </div>
+
+      {/* Main content */}
+      <main style={{ maxWidth: 1400, margin: "0 auto", padding: "28px 28px 60px" }}>
+        {role === "coach"   && <CoachView d={data} />}
+        {role === "trainer" && <TrainerView d={data} />}
+        {role === "doctor"  && <DoctorView d={data} />}
+        {role === "athlete" && <AthleteView d={data} />}
+      </main>
+
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=IBM+Plex+Mono:wght@300;400;500&display=swap');
+        * { box-sizing: border-box; }
+        body { margin: 0; }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: ${T.bg}; }
+        ::-webkit-scrollbar-thumb { background: ${T.border2}; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: ${T.text3}; }
+        @keyframes rise { from { opacity:0; transform:translateY(12px); } to { opacity:1; transform:translateY(0); } }
+        table tr:hover td { background: ${T.surf2}; }
+      `}</style>
+    </div>
+  );
+}
